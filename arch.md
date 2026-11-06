@@ -46,6 +46,20 @@ Two ideas make the rest easier:
 6. The platform checks the ticket, marks it as used, and records: **Slack workspace T123 belongs to Acme, status LINKED**.
 7. Hannah sees a page saying the bot is installed and connected to Acme.
 
+**APIs called:**
+
+| Step | Who calls | API call | Handled by |
+|---|---|---|---|
+| 1 | Website → platform | `POST /api/v1/auth/token` (Hannah's normal login) | iam auth |
+| 2 | Website → platform | `POST /api/v1/slack/install-state` → `{ state, expiresAt }` | `SlackWorkspaceController` → `SlackWorkspaceService.issueInstallState` |
+| 3 | Browser → bot | `GET /api/slack/install?platform_state=<state>` | bot `pages/api/slack/install.ts` |
+| 3 | Bot → Slack | Redirect to `https://slack.com/oauth/v2/authorize?client_id=…&scope=…&state=…` | Slack |
+| 4 | Slack → bot | `GET /api/slack/oauth_redirect?code=…&state=…` | bot `oauth_redirect.ts` → `lib/slackInstall.ts` |
+| 4 | Bot → Slack | `oauth.v2.access` (swap the code for the bot token) | Slack Web API |
+| 5 | Bot → platform | `POST /oauth2/token` (`grant_type=client_credentials`, `scope=slack:install`) | auth-server |
+| 5 | Bot → platform | `POST /v1/slack/installations` `{ teamId, teamName, installedBySlackUser, state }` | `PublicSlackInstallationController` → `SlackWorkspaceService` |
+| 6 | Platform → bot | Response `{ status: "LINKED", … }` | |
+
 **What's saved:** the platform saves the workspace (`slack_workspace`, LINKED to Acme) and marks the one-time ticket as used (`slack_install_state`). The bot saves the Slack token in its own encrypted file.
 
 **Can go wrong here:** the ticket isn't tied to *who* uses it, so a link sent to another company's Slack admin could connect *their* Slack to Acme (issue #6).
@@ -65,6 +79,21 @@ Two ideas make the rest easier:
 
 **Or ops do it:** Centuro ops can open the **Slack workspaces** admin page and link (or unlink) any workspace to a company by hand.
 
+**APIs called:**
+
+| Step | Who calls | API call | Handled by |
+|---|---|---|---|
+| 1 | Browser → bot | `GET /api/slack/install` (no `platform_state`), then Slack's authorize page | bot `install.ts` |
+| 1 | Slack → bot, bot → Slack | `GET /api/slack/oauth_redirect?code=…`, then `oauth.v2.access` | bot `oauth_redirect.ts` |
+| 2 | Bot → platform | `POST /oauth2/token` (`scope=slack:install`) | auth-server |
+| 2–3 | Bot → platform | `POST /v1/slack/installations` `{ teamId, teamName, installedBySlackUser }` → `{ status: "PROSPECT", claimToken }` | `PublicSlackInstallationController` → `SlackWorkspaceService` |
+| 4 | Bot → installer | Link `PLATFORM_APP_URL/slack/claim#token=<claimToken>` | bot `lib/slackInstall.ts` |
+| 5 | Hannah | Opens the website's `/slack/claim` page, logs in (`POST /api/v1/auth/token`) | cg-web-app `SlackClaimComponent` |
+| 6 | Website → platform | `POST /api/v1/slack/workspaces/claim` `{ token }` | `SlackWorkspaceController` → `SlackWorkspaceService.claim` |
+| Ops | Website → platform | `GET /api/v1/admin/slack/workspaces` (list) | `AdminSlackWorkspaceController` |
+| Ops | Website → platform | `PUT /api/v1/admin/slack/workspaces/{teamId}/corporate` `{ corporateId }` (link) | `AdminSlackWorkspaceController` |
+| Ops | Website → platform | `DELETE /api/v1/admin/slack/workspaces/{teamId}/corporate` (unlink) | `AdminSlackWorkspaceController` |
+
 **What's saved:** the workspace (`slack_workspace`), first as PROSPECT with a claim code, then LINKED to Acme.
 
 **Can go wrong here:**
@@ -82,6 +111,14 @@ Two ideas make the rest easier:
 2. The platform checks that T123 is still **linked** to a company, and issues a pass that says *"bot, working for Acme, workspace T123"*.
 3. The bot shows this pass on every request. Each time, the platform checks again that T123 is still linked. If Acme unlinked or removed the bot a second ago, the pass stops working.
 4. The pass only gives access to **Acme's** data for **that** workspace. Asking for anything else gets "not found".
+
+**APIs called:**
+
+| Step | Who calls | API call | Handled by |
+|---|---|---|---|
+| 1–2 | Bot → platform | `POST /oauth2/token` with `grant_type=client_credentials`, `scope=queries:write queries:read slack-identities:write`, `slack_team_id=T123` (Basic auth with the bot's client id and secret) → a 10-minute JWT carrying `corporate_id` + `slack_team_id` | auth-server `CenturoTokenCustomizer` / `TokenClaimsService` |
+| 3 | Bot → platform | Every `/v1/...` call carries `Authorization: Bearer <token>` | public-api `PublicApiAuthenticationConverter` + `PublicApiSlackWorkspaceChecker` (still linked?) |
+| (optional) | Bot → platform | `GET /v1/slack/workspaces/{teamId}` (workspace + company name) | `PublicSlackWorkspaceController` |
 
 **What's saved:** a record of each pass issued (`oauth2_authorization`). This table is never cleaned up.
 
@@ -104,6 +141,22 @@ Two ideas make the rest easier:
    - Priya's first message in that chat, marked "from Slack"
 7. The bot adds the AI's answer to the chat, marked "from the AI".
 8. **Nobody is notified.** No emails, no alert to Centuro's support team, and no entry in Acme's query lists. Hannah can't see Priya's AI chats. It's just a private record.
+
+**APIs called:**
+
+| Step | Who calls | API call | Handled by |
+|---|---|---|---|
+| 1 | Slack → bot | `POST /api/slack/events` (event `message`, channel type `im`; signed by Slack) | bot `pages/api/slack/events.ts` |
+| 1 | Bot → Slack | `conversations.history` / `conversations.replies` (earlier messages in the DM) | bot `lib/dmContext.ts` |
+| 2 | Bot → Claude | Claude Messages API (`messages.create`) | bot `lib/claude.ts` |
+| 2 | Bot → Slack | `chat.postMessage`, then `chat.update` (placeholder, then the answer) | bot `lib/slackClient.ts` |
+| 3 | Bot → Slack | `users.info` (email, confirmed?, guest?) | bot `lib/platformSync.ts` |
+| 3 | Bot → platform | `POST /oauth2/token` (workspace token, Scenario 3) | auth-server |
+| 3–4 | Bot → platform | `POST /v1/slack/identities` `{ slackUserId, email, emailConfirmed, firstName, lastName, guest, external }` → `{ status: "READY", identity: "<uuid>" }` | `PublicSlackIdentityController` → `SlackIdentityService` |
+| 5 | Bot → platform | `GET /v1/queries?slackThreadTs=<ts>&limit=10` (already copied?) | `PublicQueryController` |
+| 5–6 | Bot → platform | `POST /v1/queries` + header `Idempotency-Key` `{ identity, heading, country, categories, message, slack: { channelId, threadTs } }` → `201` with `qry_…` | `PublicQueryController` → `PublicApiIdempotencyService` → `AiQueryService.create` |
+| 7 | Bot → platform | `POST /v1/queries/{qry_…}/messages` + `Idempotency-Key` `{ author: "ai", text }` (and `author: "employee"` for Priya's next messages) | `PublicQueryController` → `AiQueryService.addMessage` |
+| 8 | — | No calls: no email, notification or alert APIs are touched | |
 
 **What's saved:**
 - the Slack-to-Centuro match (`slack_identity`), plus an audit entry
@@ -131,6 +184,15 @@ Two ideas make the rest easier:
 | Someone whose email belongs to **another Centuro client**, or to a suspended account | Put on hold for Centuro ops to sort out by hand | Waiting for review |
 
 Ops have a **Slack identities** admin page to see the people waiting for review, link each one to the right account, or remove them.
+
+**APIs called:**
+
+| When | Who calls | API call | Handled by |
+|---|---|---|---|
+| Every case in the table | Bot → platform | `POST /v1/slack/identities` → `{ status: READY \| UNSUPPORTED \| PENDING_REVIEW, identity?, reason? }` | `PublicSlackIdentityController` → `SlackIdentityService.resolve` (draft accounts via `CorporateUserService.createCorporateUser`) |
+| Ops: see who's waiting | Website → platform | `GET /api/v1/admin/slack/identities` | `AdminSlackIdentityController` |
+| Ops: link to an account | Website → platform | `PUT /api/v1/admin/slack/identities/{id}/user` `{ userId }` | `AdminSlackIdentityController` → `SlackIdentityService` |
+| Ops: forget | Website → platform | `DELETE /api/v1/admin/slack/identities/{id}` | `AdminSlackIdentityController` |
 
 **Can go wrong here:**
 - **If Acme hasn't set allowed domains, anyone in Acme's Slack becomes a draft user**, including Tom the contractor with his own company email. Worse, Tom's firm can then **no longer sign up for Centuro** ("domain already exists") (reproduced).
@@ -162,6 +224,23 @@ Ops have a **Slack identities** admin page to see the people waiting for review,
 8. Priya sees **"Your question has been passed to a Centuro expert"**. A few seconds later, the bot also says so in Slack (Scenario 7 explains how).
 9. From now on the query appears in Centuro's support lists **and in Acme's own query list**. That was decided on purpose: clients should see their staff's expert questions.
 
+**APIs called:**
+
+| Step | Who calls | API call | Handled by |
+|---|---|---|---|
+| 1–2 | Slack → bot | `POST /api/slack/interactions` (button actions such as `confirm_ai_upgrade`, then the scope/cost card) | bot `pages/api/slack/interactions.ts` |
+| 2 | Bot → Slack | `chat.update` / `chat.postMessage` with the link `PLATFORM_APP_URL/query/upgrade/{qry_…}` (via the company login page) | bot `lib/upgrade.ts` |
+| 3 | Website → platform | `POST /api/v1/auth/token` (login), or the sign-up / activation pages | iam |
+| 4 | Website → platform | `GET /api/v1/ta-application/fees?queryPublicId=qry_…` → the £25 fee row, `id` (transaction), `paymentStatus`, `queryId` | `TAApplicationController` → `QueryUpgradeFeeService` |
+| 5a | Website → platform | `POST /api/v1/ta-application/payment/checkout?transactionId=…&origin=…&successUrl=…` → Stripe Checkout `sessionId` | `TAApplicationController` → Stripe API (create Checkout Session) |
+| 5a | Priya → Stripe | Stripe's hosted payment page | Stripe |
+| 5b | Website → platform | `POST /api/v1/ta-application/payment/verify` `{ transactionId, sessionId }` | `TAApplicationController` → `TAApplicationService` → Stripe `Session.retrieve` → `PaymentFinalizationService` |
+| 5c | Stripe → platform | `POST /api/v1/stripe-callback/checkout-session` (event `checkout.session.completed`, Stripe-signed) | `StripeCallbackController` → `StripeEventLogService` → `QueryUpgradeFeeService` |
+| 6 | Website → platform | `POST /api/v1/ta-application/payment/verify` `{ transactionId, sessionId: null }` (company pays) | same as 5b |
+| 7 | Inside the platform | No HTTP call: the internal event `QueryUpgradePaidEvent` → `QueryUpgradePaidListener` → `AiQueryService.upgradePaid` | engagement |
+| 8 | Platform → bot | `POST /api/platform/relay` `{ type: "status", status: "upgraded", queryId }` (sent by the worker, see Scenario 7) | bot `pages/api/platform/relay.ts` |
+| (unused) | Bot → platform | `POST /v1/queries/{id}/upgrade` `{ paymentReference: <transaction id> }`: exists in the API, but the current bot doesn't call it | `PublicQueryController` → `AiQueryService.upgrade` |
+
 **What's saved:** the payment record (`visa_transactions`, type QUERY), Stripe's message (`stripe_event`), the updated query (now human), the audit entry (`ai_query_action`), the support alert (`notification_event`) and the note for the bot (`slack_relay_event`).
 
 **Can go wrong here:**
@@ -184,6 +263,18 @@ Ops have a **Slack identities** admin page to see the people waiting for review,
 
 **Priya replies in Slack:** the bot adds her message to the query chat, marked "from Slack". After the upgrade, that **emails Sarah** like a normal web reply. Priya's own Slack messages are never sent back to her (no echo).
 
+**APIs called:**
+
+| Step | Who calls | API call | Handled by |
+|---|---|---|---|
+| 1 | Website → platform | `GET /api/v1/group-chat/message?chatType=QUERY&referenceId=<id>&lastMessageDateTime=<ms>` (open the chat; see issue #2) | `GroupChatController` → `GroupChatService.getMessages` |
+| 1–2 | Website → platform | `POST /api/v1/group-chat/message` `{ message, chatType: "QUERY", referenceId }` | `GroupChatController` → `GroupChatService` → `SlackRelayService.messagePosted` |
+| 3 | Inside the platform | Emails go through the existing notification/email services; for Slack queries `GroupChatEmailService` leaves Priya out | chat |
+| 4 | Platform → bot | `POST {app.slack-relay.url}` = bot `/api/platform/relay`, headers `X-Centuro-Request-Timestamp` and `X-Centuro-Signature: v1=<HMAC>`, body `{ id, type: "message", teamId, channelId, threadTs, authorName, authorRole, text }` | `SlackRelayWorker` → `SlackRelayClient` |
+| 5 | Bot → Slack | `chat.postMessage` into Priya's thread | bot `lib/platformRelay.ts` |
+| Priya replies | Slack → bot | `POST /api/slack/events` | bot `events.ts` |
+| Priya replies | Bot → platform | `POST /v1/queries/{qry_…}/messages` + `Idempotency-Key` `{ author: "employee", text }` | `PublicQueryController` → `AiQueryService.addMessage` (emails Sarah after the upgrade) |
+
 **What's saved:** the message (`group_chat_messages`, from the web) and the to-do note (`slack_relay_event`: waiting, then sent or failed).
 
 **Can go wrong here:**
@@ -198,6 +289,17 @@ Ops have a **Slack identities** admin page to see the people waiting for review,
 2. **Priya ends it in Slack, or switches topic.** The bot treats that as the end of that conversation on its side.
 3. **Nobody says anything for a long time.** The bot treats an open conversation as abandoned after a while.
 
+**APIs called:**
+
+| Case | Who calls | API call | Handled by |
+|---|---|---|---|
+| 1 | Website → platform | `PUT /api/v1/queries/{queryId}?status=RESOLVED` | `QueryController` → `QueryService.updateStatus` → `SlackRelayService` |
+| 1 | Platform → bot | `POST /api/platform/relay` `{ type: "status", status: "resolved", … }` | `SlackRelayWorker` → bot `platformRelay.ts` → `chat.postMessage` |
+| 2 | Slack → bot | `POST /api/slack/interactions` (e.g. `confirm_resolved`). Handled on the bot's side only; the platform isn't called | bot `interactions.ts` |
+| 3 | — | No call: the bot decides from the DM history | bot `lib/dmContext.ts` |
+| (unused) | Bot → platform | `POST /v1/queries/{id}/resolve` `{ reason: "employee_closed" \| "topic_switch" \| "pii_guardrail" }` | `PublicQueryController` → `AiQueryService.resolve` |
+| (unused) | Bot → platform | `POST /v1/queries/{id}/close-inactive` (409 if active in the last 48h) | `PublicQueryController` → `AiQueryService.closeInactive` |
+
 **For later:** the platform also has "resolve" and "close after 48 hours of inactivity" actions that the bot could call. **Today's bot doesn't use them.** But if it (or anything else) did, it could close a question Priya **has paid for**, and Sarah's replies wouldn't count as activity (issue #4, reproduced against the API).
 
 ---
@@ -208,6 +310,17 @@ Ops have a **Slack identities** admin page to see the people waiting for review,
 2. Slack tells the bot ("app uninstalled"). The bot deletes its Slack token for Acme and tells the platform.
 3. The platform marks the workspace **UNINSTALLED** but **remembers it belonged to Acme**. Any pass the bot held for Acme stops working at once.
 4. If Acme reinstalls later, the workspace goes straight back to **LINKED** to Acme.
+
+**APIs called:**
+
+| Step | Who calls | API call | Handled by |
+|---|---|---|---|
+| 2 | Slack → bot | `POST /api/slack/events` (event `app_uninstalled` or `tokens_revoked`) | bot `events.ts` → `lib/slackUninstall.ts` |
+| 2 | Bot → platform | `POST /oauth2/token` (`scope=slack:install`) | auth-server |
+| 2–3 | Bot → platform | `POST /v1/slack/installations/{teamId}/uninstall` → `204` | `PublicSlackInstallationController` → `SlackWorkspaceService` |
+| 3 | — | Any later `/v1` call with an old workspace token gets refused (the check in Scenario 3) | `PublicApiSlackWorkspaceChecker` |
+| 4 | Bot → platform | Same calls as Scenario 1 or 2, ending in `POST /v1/slack/installations` | `PublicSlackInstallationController` |
+| Ops | Website → platform | `PUT` / `DELETE /api/v1/admin/slack/workspaces/{teamId}/corporate` (re-link or unlink) | `AdminSlackWorkspaceController` |
 
 **Can go wrong here:**
 - Ops can re-link an uninstalled workspace, and the platform will then issue passes for a workspace where the app isn't installed.
