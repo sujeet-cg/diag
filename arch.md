@@ -2,13 +2,239 @@
 
 This explains the whole Slack bot feature (cg-web-api stack #187, plus the bot and web-app PRs it depends on): every flow from the **"Add to Slack"** button to the expert reply arriving back in Slack. For each step it shows which API is called, which code handles it, and what gets stored where.
 
-Section 9 then marks where each issue found in the review sits in these flows.
+**Start with section 0.** It walks through every scenario in plain language, as a story. Sections 1–9 then show the same flows technically (APIs, code, tables), and section 10 marks where each issue found in the review sits.
 
 > The diagrams are Mermaid. They display as diagrams on GitHub, in VS Code (Markdown preview with Mermaid support) and on mermaid.live.
 > Everything here was taken from the code at the top of each branch:
 > - cg-web-api: `feature/CG-3179-query-escalation-payment`
 > - cg-apps: `feat/slack-bot/import`
 > - cg-web-app: `feature/CG-3187-slack-link`, plus `feature/CG-3179-query-escalation-payment` for the payment pages
+
+---
+
+## 0. The whole thing as a story (start here)
+
+### The cast
+
+| Who | Role |
+|---|---|
+| **Acme Ltd** | A Centuro client company |
+| **Hannah** | Acme's HR admin. She has a Centuro login with full access to Acme's users |
+| **Priya** | An Acme employee. She uses Slack every day and may never have logged into Centuro |
+| **Tom** | A contractor from another firm who is a member of Acme's Slack |
+| **The bot** | "Centuro" in Slack: the Slack app in cg-apps |
+| **The platform** | Centuro's backend (cg-web-api) and website (cg-web-app) |
+| **Sarah** | A Centuro consultant who answers questions in the Centuro web app |
+| **Ops** | Centuro's back-office team |
+
+Two ideas make the rest easier:
+- **The bot does the chatting, and the platform keeps the records.** The bot answers Priya in Slack, and quietly copies the conversation to the platform, so Centuro has the history and can take over if needed.
+- **The platform never talks to Slack directly.** When Centuro has something to say to Priya, it hands the message to the bot, and the bot posts it in Slack.
+
+---
+
+### Scenario 1: Acme connects its Slack from the Centuro website
+
+*Hannah wants her team to be able to ask Centuro questions in Slack.*
+
+1. Hannah logs into the Centuro website and clicks **"Add to Slack"**.
+   - The button only shows if the Slack feature is set up, and only for admins like Hannah.
+2. Behind the scenes, the website asks the platform for a **one-time ticket** saying "this install is for Acme". The ticket lasts 15 minutes and can be used only once.
+3. Hannah's browser goes to the bot, carrying the ticket. The bot holds on to it and sends Hannah to **Slack's own permission screen**: "Centuro wants to post messages, read DMs sent to it, see users' emails…"
+4. Hannah clicks **Allow**. Slack sends her back to the bot with proof of approval, and the bot swaps that for its own **Slack bot token** for Acme's workspace.
+5. The bot saves that token (encrypted, on its side only), then tells the platform: *"I've been installed in Slack workspace T123, here's the ticket."*
+6. The platform checks the ticket, marks it as used, and records: **Slack workspace T123 belongs to Acme, status LINKED**.
+7. Hannah sees a page saying the bot is installed and connected to Acme.
+
+**What's saved:** the platform saves the workspace (`slack_workspace`, LINKED to Acme) and marks the one-time ticket as used (`slack_install_state`). The bot saves the Slack token in its own encrypted file.
+
+**Can go wrong here:** the ticket isn't tied to *who* uses it, so a link sent to another company's Slack admin could connect *their* Slack to Acme (issue #6).
+
+---
+
+### Scenario 2: someone installs the bot straight from Slack, and Acme claims it later
+
+*Someone in Acme's Slack finds the Centuro bot and installs it without going through the Centuro website.*
+
+1. They click install and approve Slack's permission screen, as in Scenario 1, but **without a ticket**.
+2. The bot tells the platform: *"I've been installed in workspace T123"*. The platform doesn't know which company that is yet.
+3. The platform records the workspace as a **PROSPECT** (not linked to anyone) and creates a **claim link** that is valid for 7 days. It keeps only a scrambled copy of the link's code, so even the database can't be used to rebuild it.
+4. The bot shows the installer the claim link: `…/slack/claim#token=…`.
+5. The installer passes the link to Hannah. Hannah opens it, logs into Centuro and confirms.
+6. The platform checks that Hannah is an admin, then links the workspace to Acme (**LINKED**) and deletes the claim code.
+
+**Or ops do it:** Centuro ops can open the **Slack workspaces** admin page and link (or unlink) any workspace to a company by hand.
+
+**What's saved:** the workspace (`slack_workspace`), first as PROSPECT with a claim code, then LINKED to Acme.
+
+**Can go wrong here:**
+- Installing again creates a new claim link and breaks the old one.
+- Ops can "link" a workspace where the app has been removed (Aniket #11).
+- A suspended company can still be linked.
+
+---
+
+### Scenario 3: every time the bot talks to the platform, it proves which workspace it's working for
+
+*This happens silently before every action in the scenarios below.*
+
+1. The bot asks the platform for a short-lived pass (a **token**, valid for 10 minutes): *"I need to work for workspace T123."*
+2. The platform checks that T123 is still **linked** to a company, and issues a pass that says *"bot, working for Acme, workspace T123"*.
+3. The bot shows this pass on every request. Each time, the platform checks again that T123 is still linked. If Acme unlinked or removed the bot a second ago, the pass stops working.
+4. The pass only gives access to **Acme's** data for **that** workspace. Asking for anything else gets "not found".
+
+**What's saved:** a record of each pass issued (`oauth2_authorization`). This table is never cleaned up.
+
+**Can go wrong here:** the platform never checks whether **Acme itself has been suspended**. A suspended company's bot keeps working (reproduced).
+
+---
+
+### Scenario 4: Priya asks her first question
+
+*Priya opens a DM with the bot: "Can I work from Spain for 3 months?"*
+
+1. Slack sends the message to the bot. The bot checks it really came from Slack, then reads the earlier messages in that DM so it has the context.
+2. The bot asks **Claude (the AI)** for an answer, or for clarifying questions, and **posts the reply to Priya straight away**. Priya is always answered first; copying to the platform happens afterwards.
+3. Now the bot copies the conversation to the platform. First it needs to know **who Priya is in Centuro**. It asks Slack for Priya's profile (email, whether the email is confirmed, whether she's a guest), and sends that to the platform.
+4. The platform decides who Priya is (see Scenario 5 for every outcome). Say Priya already has a Centuro account at Acme: she's **matched to that account**. The platform gives the bot an anonymous reference for her and doesn't say whether the account already existed.
+5. The bot asks the platform to **create a query** for the conversation: a title and category (worked out by the AI), the first message, and which Slack thread it came from. The request carries a **"don't do this twice" key**, so a retry doesn't create a second query.
+6. The platform creates:
+   - a **query** marked as **AI** and from **Slack**, with a public ID like `qry_3f9…`
+   - a **private chat** for it, with only Priya and the bot in it
+   - Priya's first message in that chat, marked "from Slack"
+7. The bot adds the AI's answer to the chat, marked "from the AI".
+8. **Nobody is notified.** No emails, no alert to Centuro's support team, and no entry in Acme's query lists. Hannah can't see Priya's AI chats. It's just a private record.
+
+**What's saved:**
+- the Slack-to-Centuro match (`slack_identity`), plus an audit entry
+- the query (`query`, kind AI) and its chat (`group_chat`, `group_chat_messages`)
+- the stored answer for the "don't do this twice" key (`public_api_idempotency`)
+
+**Can go wrong here:**
+- **Priya is matched on email alone.** If her email was Hannah's, the bot would act as Hannah (issue #5).
+- **A very long first message** (over 2,000 characters) crashes query creation, every time (reproduced).
+- **Two requests arriving at the same moment** with the same key create two queries (issue #7, reproduced).
+- **AI and Slack text is stored as-is,** but the website shows chat as formatted text (HTML).
+
+---
+
+### Scenario 5: who is this Slack user? (every outcome)
+
+*What the platform does in step 4 above, for different people.*
+
+| The Slack user is… | What happens | Result |
+|---|---|---|
+| Priya, an existing Acme user | Matched to her account | Ready |
+| New at Acme, with no Centuro account yet | A **silent draft account** is created for them in Acme, with no email and no password, and they're matched to it | Ready |
+| New, and Acme has set "allowed domains" (e.g. only `acme.com`) but their email isn't on it | Refused | Not supported |
+| A Slack **guest**, someone from **another company's Slack** (Slack Connect), or a user with no or unconfirmed email | Refused, nothing stored | Not supported |
+| Someone whose email belongs to **another Centuro client**, or to a suspended account | Put on hold for Centuro ops to sort out by hand | Waiting for review |
+
+Ops have a **Slack identities** admin page to see the people waiting for review, link each one to the right account, or remove them.
+
+**Can go wrong here:**
+- **If Acme hasn't set allowed domains, anyone in Acme's Slack becomes a draft user**, including Tom the contractor with his own company email. Worse, Tom's firm can then **no longer sign up for Centuro** ("domain already exists") (reproduced).
+- A very long email crashes the request (Aniket #12, reproduced).
+- Suspended users who were already matched carry on working.
+
+---
+
+### Scenario 6: Priya wants to talk to a real person (the £25 expert upgrade)
+
+*The AI's answer isn't enough. The bot offers "Talk to a person".*
+
+1. Priya clicks **"Talk to a person"**. The bot shows what an expert will do, and the price.
+2. Priya confirms. The bot gives her a link to the **Centuro website's upgrade page** for her query (through Acme's own login page, if Acme has one).
+3. Priya opens the link and logs in. If she only has a silent draft account, she signs up to activate it; that part is in the later PR CG-3188.
+4. The website asks the platform for the **fee for this query**. The platform checks it's Priya's own question, it came from Slack, and it's still open. It then creates a **payment record** for £25:
+   - **If Priya pays:** the record is "not paid yet".
+   - **If Acme pays for its staff:** the record is "not required", meaning no card is needed.
+5. **If Priya pays by card:**
+   1. The website opens **Stripe's payment page**, and Priya pays £25.
+   2. Stripe sends her back to Centuro, and the website asks the platform to **check with Stripe** that the payment went through.
+   3. As a backup, Stripe also **messages the platform directly** ("payment completed"). That way, if Priya closes the tab before coming back, the payment is still recorded. Whichever arrives first wins, and the second changes nothing.
+6. **If Acme pays:** the website just confirms. No card is needed.
+7. Once the fee is settled, the platform **hands the query over to Centuro**:
+   - The query changes from **AI** to **human**, and the upgrade time is recorded.
+   - Centuro's admins are added to the chat. Acme's managers are **not** added, so it stays between Priya and Centuro.
+   - **Centuro's support team is alerted** by email, in the support Slack channel and in-app ("Slack query upgraded to an expert: …").
+   - The action is written to an audit log, and a note is queued to tell the bot.
+8. Priya sees **"Your question has been passed to a Centuro expert"**. A few seconds later, the bot also says so in Slack (Scenario 7 explains how).
+9. From now on the query appears in Centuro's support lists **and in Acme's own query list**. That was decided on purpose: clients should see their staff's expert questions.
+
+**What's saved:** the payment record (`visa_transactions`, type QUERY), Stripe's message (`stripe_event`), the updated query (now human), the audit entry (`ai_query_action`), the support alert (`notification_event`) and the note for the bot (`slack_relay_event`).
+
+**Can go wrong here:**
+- **If the query was closed while Priya was paying, she's still told "passed to an expert", but nothing happens.** It's only logged (issue #3, reproduced).
+- **If Acme pays, any employee can upgrade any number of questions.** Even *opening* the fee page counts as paid, with no limit and no approval (reproduced).
+- **The chat now crashes for Priya and Hannah** when they open it on the website. Only admins can open it (issue #2, reproduced).
+
+---
+
+### Scenario 7: Sarah replies, and Priya gets it in Slack
+
+*Sarah, a Centuro consultant, picks up the query in the Centuro web app and replies.*
+
+1. Sarah types a reply in the query chat on the Centuro website.
+2. The platform saves her message in the chat. In the **same step**, it adds a "send this to Slack" note to a **to-do list** (an "outbox"). Because both happen together, a reply can't be saved without its note.
+3. **Email:** other Centuro staff on the query get the usual email. **Priya does not**: for Slack questions, Priya is meant to hear in Slack, not by email.
+4. Every 5 seconds, a background job in the platform checks the to-do list. For each waiting note, it sends it to the bot with a **signature**, so the bot knows it really came from Centuro.
+5. The bot checks the signature and posts Sarah's reply **in Priya's Slack thread**, under Sarah's name.
+6. If that works, the note is marked **sent**. If not, the job **tries again later**: after 1 minute, 5, 15, 60, then 3 and 6 hours, and every 6 hours after that. After 24 hours it gives up and marks it **failed**. Notes for the same query are sent **in order**, so a later reply waits for an earlier one.
+
+**Priya replies in Slack:** the bot adds her message to the query chat, marked "from Slack". After the upgrade, that **emails Sarah** like a normal web reply. Priya's own Slack messages are never sent back to her (no echo).
+
+**What's saved:** the message (`group_chat_messages`, from the web) and the to-do note (`slack_relay_event`: waiting, then sent or failed).
+
+**Can go wrong here:**
+- **If Slack refuses a message** (for example, the channel was deleted), the job keeps retrying something that will never work, and **Sarah's later replies queue up behind it**. Priya gets nothing in Slack and nothing by email (issue #8, seen locally).
+- The Slack sending is **switched off everywhere except developers' machines**, but the "don't email Priya" rule is always on.
+
+---
+
+### Scenario 8: the question is finished
+
+1. **Sarah marks it resolved on the website.** The platform saves the status and queues a "resolved" note for the bot (same to-do list as Scenario 7). The bot tells Priya in Slack, and that conversation is closed. Priya's next message starts a new one.
+2. **Priya ends it in Slack, or switches topic.** The bot treats that as the end of that conversation on its side.
+3. **Nobody says anything for a long time.** The bot treats an open conversation as abandoned after a while.
+
+**For later:** the platform also has "resolve" and "close after 48 hours of inactivity" actions that the bot could call. **Today's bot doesn't use them.** But if it (or anything else) did, it could close a question Priya **has paid for**, and Sarah's replies wouldn't count as activity (issue #4, reproduced against the API).
+
+---
+
+### Scenario 9: Acme removes the bot (and maybe adds it back)
+
+1. An Acme Slack admin removes the Centuro app from Slack.
+2. Slack tells the bot ("app uninstalled"). The bot deletes its Slack token for Acme and tells the platform.
+3. The platform marks the workspace **UNINSTALLED** but **remembers it belonged to Acme**. Any pass the bot held for Acme stops working at once.
+4. If Acme reinstalls later, the workspace goes straight back to **LINKED** to Acme.
+
+**Can go wrong here:**
+- Ops can re-link an uninstalled workspace, and the platform will then issue passes for a workspace where the app isn't installed.
+- Moving a workspace to a different company leaves the old people matched to accounts they can no longer use (Aniket #10, #11).
+- Deleting a company or user that has Slack data fails with an error (Aniket #9).
+
+---
+
+### One-page summary
+
+```
+Add to Slack (website) ──► Slack approves ──► bot saves token ──► platform: workspace LINKED to company
+        or
+Install from Slack ──► platform: PROSPECT + claim link ──► company admin claims ──► LINKED
+
+Employee DMs the bot ──► AI answers in Slack immediately
+                     └─► bot copies to platform: match the person ──► private AI query + chat (nobody notified)
+
+"Talk to a person" ──► website upgrade page ──► pay £25 (card via Stripe, or company pays)
+                   └─► platform: query becomes HUMAN, Centuro added, support alerted, bot told
+
+Consultant replies on website ──► saved + "send to Slack" note ──► every 5s sent to bot (signed) ──► posted in Slack
+Employee replies in Slack     ──► bot adds it to the query chat ──► consultant emailed
+
+Resolved on website ──► "resolved" note ──► bot tells the employee
+App removed from Slack ──► workspace UNINSTALLED (company remembered) ──► passes stop working
+```
 
 ---
 
